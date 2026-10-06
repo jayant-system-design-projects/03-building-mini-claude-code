@@ -38,7 +38,7 @@ READ_TOOLS = {
         "schema": ToolBase(
             function=Function(
                 name="read_file",
-                description="Read and return the contents of a file or file at any path",
+                description="Read and return the contents of a file or file at any path if not give use current directory.",
                 parameters=Parameters(
                     properties={
                         "file_path": Properties(
