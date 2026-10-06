@@ -43,7 +43,7 @@ WRITE_TOOLS = {
                     properties={
                         "file_path": Properties(
                             type="string",
-                            description="The path of the file to write to",
+                            description="The path of the file to write to if not provided use current directory",
                         ),
                         "content": Properties(
                             type="string",

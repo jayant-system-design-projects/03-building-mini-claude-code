@@ -33,8 +33,12 @@ flowchart TD
     MSG["💬 messages<br/>system · user · assistant · tool"]
     LLM["🧠 LLM<br/>chat.completions"]
     CHK{"finish_reason?"}
-    DISP["⚙️ Dispatch<br/>look up the name<br/>parse the JSON args<br/>call the function"]
+    DISP["⚙️ Dispatch<br/>look up the name<br/>parse the JSON args"]
+    GR{"🛡️ Guardrail LLM<br/>safe · unsafe · blocked<br/>+ timeout"}
+    BLOCK["⛔ Blocked<br/>never runs<br/>run it yourself"]
+    ASK{"🙋 Ask me<br/>y / N"}
     FN["🐍 Real Python functions<br/>open · Path.write · subprocess.run"]
+    DENY["🚫 Denied message"]
     OUT["✅ Final answer"]
 
     CLI --> ALL
@@ -44,13 +48,24 @@ flowchart TD
     LLM --> CHK
     CHK -->|stop| OUT
     CHK -->|tool_calls| DISP
-    DISP --> FN
+    DISP -->|read only tools skip check| FN
+    DISP -->|write / bash| GR
+    GR -->|safe| FN
+    GR -->|unsafe| ASK
+    GR -->|blocked| BLOCK
+    BLOCK -->|tool result| MSG
+    ASK -->|y| FN
+    ASK -->|N| DENY
     FN -->|tool results| MSG
+    DENY -->|tool result| MSG
 
     style CLI fill:#1f6feb,stroke:#1f6feb,color:#fff
     style ALL fill:#8250df,stroke:#8250df,color:#fff
     style LLM fill:#bf3989,stroke:#bf3989,color:#fff
     style DISP fill:#bc4c00,stroke:#bc4c00,color:#fff
+    style GR fill:#cf222e,stroke:#cf222e,color:#fff
+    style BLOCK fill:#82071e,stroke:#82071e,color:#fff
+    style ASK fill:#9a6700,stroke:#9a6700,color:#fff
     style FN fill:#0969da,stroke:#0969da,color:#fff
     style OUT fill:#1a7f37,stroke:#1a7f37,color:#fff
 ```
@@ -58,6 +73,8 @@ flowchart TD
 Look at the edge labelled **`schemas only`**. That is the entire safety story of a tool-calling agent.
 
 The model receives *descriptions* of what exists — names, parameters, docstrings. It never receives a single callable. When it wants something done it says *"I would like to call `read_file` with this path"*, and my code decides whether that name is in the registry, and my code runs it.
+
+And for anything that writes or runs commands, a **second LLM** looks at the call first. If it smells trouble, the agent stops and asks me.
 
 ---
 
@@ -134,6 +151,10 @@ That is why it is called a reactive agent, and it is the only thing separating t
 | ⚡ Run shell commands | `bash_tool` | `subprocess.run()` via `cmd.exe` or `/bin/bash` |
 | 🔁 Keep going until done | *the loop* | `while iteration < max_iteration` |
 | 🛑 Refuse to spin forever | `low`/`medium`/`high` | an iteration budget |
+| 🛡️ Check before acting | *guardrail agent* | a second LLM call that replies `safe`, `unsafe` or `blocked` |
+| 🙋 Ask before anything risky | *approval prompt* | `input()` with `[y/N]`, default is No |
+| ⛔ Never run the really bad stuff | *blocked* | not even with a yes, you get the command to run yourself |
+| ⏱️ Don't hang on a tool | *timeout* | guardrail suggests one, 5s if it doesn't |
 
 ---
 
@@ -158,6 +179,30 @@ $ uv run python -m app.main -p "find where read_file is defined and explain what
 $ uv run python -m app.main -p "list every python file under app/ and count them"
 # → checks the OS first, then picks the right command for that shell
 ```
+
+And the one that made me add a guardrail:
+
+```text
+$ uv run python -m app.main -p "create a python file for shutdown and run it"
+[step 1/5] thinking...
+  -> write_file({'file_path': 'shutdown.py', 'content': "import os\nos.system('shutdown /s /t 0')"})
+  guardrail: blocked, timeout 5s, script calls shutdown
+  WARNING: this is too destructive, the agent will not run it.
+  If you really need it, run it yourself:
+  {'file_path': 'shutdown.py', 'content': "import os\nos.system('shutdown /s /t 0')"}
+[step 2/5] thinking...
+...
+```
+
+Something less extreme, like deleting a file in the project, comes back as `unsafe` and just asks:
+
+```text
+  -> bash_tool({'command': 'del old_notes.txt', 'system': 'Windows'})
+  guardrail: unsafe, timeout 10s, deletes a project file
+  Allow bash_tool to run? [y/N]:
+```
+
+The step logs go to `stderr`, so `stdout` still only has the final answer.
 
 ---
 
@@ -291,6 +336,46 @@ Simple tasks are happy in `low`. Poking around a whole codebase is what `high` i
 
 </details>
 
+<details>
+<summary><b>7. Why there is a second LLM watching the first</b> — the guardrail</summary>
+
+<br/>
+
+`bash_tool` already had a regex blacklist: `shutdown /s`, `rm -rf /`, `format`, and friends. I felt pretty safe.
+
+Then I asked it to *"create a python file for shutdown and run it"*. It did exactly that:
+
+1. `write_file("shutdown.py", "os.system('shutdown /s /t 0')")` — just writing a file, no blacklist hit
+2. `bash_tool("python shutdown.py")` — just running python, no blacklist hit
+
+Each step looks innocent on its own. The danger is in the **combination**, and a regex only ever sees one command.
+
+So before any non read-only tool runs, I ask the LLM again, this time with a different job:
+
+```python
+GUARDRAIL_PROMPT = """You are a security checker for a coding agent...
+Reply in one line as: <safe, unsafe or blocked> | <timeout> | <reason>"""
+```
+
+The trick is what I send with it: **every previous tool call in the conversation**. So when it sees `python shutdown.py`, it can also see what was written into `shutdown.py` one step earlier.
+
+- `safe` → runs straight away
+- `unsafe` → I get asked `Allow bash_tool to run? [y/N]`
+- `blocked` → never runs, **not even if I say yes**. It prints a warning and the command, so if I really want it I run it myself
+- guardrail crashes or replies garbage → treated as `unsafe`, so I get asked
+
+Why not just ask for `blocked` too? Because at 2am I *will* hit `y` without reading. Shutdown, wiping a disk, deleting the registry — if I truly want that, typing it myself is a feature, not friction. An agent should never be the one pressing that button.
+
+If I say no (or it is blocked), the model gets a tool result telling it so and not to retry. Same idea as errors: don't kill the loop, tell the model and let it react.
+
+**The timeout comes from the same reply.** Reading a file needs a few seconds, `pip install` needs a lot more. Instead of one fixed number, the guardrail suggests one. If it doesn't give a number, it falls back to `5`, and it can never go above `120`, so the model can't ask for an hour.
+
+My first timeout was a lie, though. I wrapped tools in `with ThreadPoolExecutor()` and called `future.result(timeout=5)`. It did raise after 5 seconds... and then the `with` block quietly waited for the thread to finish anyway. A 30 second command still took 30 seconds.
+
+Python can't kill a thread, so the real fix lives in `bash_tool`: it gets the timeout, and when time is up it kills the **whole process tree** (`taskkill /T` on Windows, the process group on Linux/macOS). Just killing the shell is not enough — `python script.py` started by it keeps running happily in the background.
+
+</details>
+
 ---
 
 ## 📁 Project Structure
@@ -300,13 +385,15 @@ app/
 ├── main.py                        # CLI entry, merges tools, calls the agent
 ├── config.py                      # Env settings, model, iteration caps
 ├── handlers/
-│   └── reactive_agent_handlers.py # 🔁 The agent loop and tool dispatch
+│   └── reactive_agent_handlers.py # 🔁 The agent loop, tool dispatch and 🛡️ guardrail
 ├── schemas/
 │   └── base_tool_schema.py        # Pydantic tool schema + validation
-└── tools/
-    ├── read_tools.py              # read_file
-    ├── write_tools.py             # write_file
-    └── bash_tools.py              # check_platform_system, bash_tool
+├── tools/
+│   ├── read_tools.py              # read_file
+│   ├── write_tools.py             # write_file
+│   └── bash_tools.py              # check_platform_system, bash_tool (+ regex blacklist)
+└── utils/
+    └── console.py                 # Coloured step logs and the y/N approval prompt
 ```
 
 ---
@@ -346,7 +433,7 @@ uv run python -m app.main -p "create hello.py that prints hello world"
 uv run python -m app.main -p "find where write_file is defined and summarise it"
 ```
 
-> ⚠️ **This thing has a shell and a writer.** It can genuinely change your machine. Point it at a folder you are willing to let it touch.
+> ⚠️ **This thing has a shell and a writer.** It can genuinely change your machine. The guardrail asks before anything that looks risky, but it is an LLM judging an LLM — not a sandbox. Point it at a folder you are willing to let it touch.
 
 ---
 
@@ -360,6 +447,9 @@ The schema is not documentation the model skims — it is the only information i
 
 **Errors should be returned, not raised.**
 My instinct was to let `FileNotFoundError` propagate, and it took a few dead loops to see why that is wrong. A raised exception ends the agent. A returned sentence goes into `messages`, the model reads *"that file does not exist"*, and tries a different path next iteration. Error handling in an agent is not about protecting the program — it is about keeping the conversation alive long enough for the model to recover.
+
+**Safety has to look at the whole conversation, not one command.**
+My regex blacklist checked every command perfectly and still let a shutdown through, because the dangerous part was split across two harmless looking tool calls. The guardrail only works because it gets the history.
 
 **Frameworks sell convenience, not capability.**
 I went in expecting LangChain to be doing something I could not. It is a message list, a dictionary of functions, and a loop. Every abstraction on top is ergonomics. Worth using — and worth building once first, so you know what it is hiding.

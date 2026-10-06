@@ -1,8 +1,41 @@
+from typing import Callable, Any
+import inspect
 import json
+from concurrent import futures
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 from app.config import Config
 from app.schemas.base_tool_schema import Tool, Mode
+from app.utils.console import log, ask_approval, GREY, RED, GREEN, CYAN, YELLOW
+
+# These tools only read so no need to check them
+SAFE_TOOLS = ["read_file", "check_platform_system"]
+
+GUARDRAIL_PROMPT = """You are a security checker for a coding agent that runs on the user's machine.
+You will get a tool call and the previous tool calls made by the agent.
+
+Reply "blocked" if the tool call is totally destructive and can not be undone, for example:
+- shutdown, restart or logoff the machine
+- format or wipe a disk, delete system folders or the whole drive (rm -rf /, del /s C:\\)
+- delete or edit registry, boot config or system services
+- fork bombs or anything that can crash the machine
+- write a script that does any of above, or run a script that was written with such code
+
+Reply "unsafe" if the tool call can harm the system but user may still want it, for example:
+- delete or overwrite files in the project
+- read secrets like .env or ssh keys, or send data to internet
+- install packages or run a script whose content you can not see
+
+Reply "safe" only if you are sure it is harmless.
+
+Also give a timeout in seconds that is enough for this tool call to finish.
+For example reading or writing a file needs 5, running tests or installing packages may need 60.
+
+Reply in one line as: <safe, unsafe or blocked> | <timeout> | <reason>
+Example: blocked | 5 | script calls shutdown"""
+
+DEFAULT_TIMEOUT = 5
+MAX_TIMEOUT = 120
 
 
 def __get_llm() -> OpenAI:
@@ -17,9 +50,104 @@ def __get_llm() -> OpenAI:
         print(f"Unable to configure ai model client due to {e}")
 
 
+def __call_function_with_timeout(
+    function: Callable, arguments: dict, timeout: int
+) -> Any:
+    """
+    This will call function for a certain time only after which this will timeout.
+
+    Parameters
+    ----------
+    function: Callable
+        This is the actual callable function.
+    timeout: int
+        This the timeout value after which function will stop time.
+
+    Returns
+    -------
+    result: Any
+        This the result from the function calling.
+    """
+    # If tool can handle timeout itself (like bash_tool killing the process) pass it
+    if "timeout" in inspect.signature(function).parameters:
+        arguments = {**arguments, "timeout": timeout}
+
+    # Not using `with` as it waits for the thread to finish even after timeout
+    executor = futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(function, **arguments)
+        # Small buffer so tool's own timeout fires first and can clean up
+        return future.result(timeout=timeout + 2)
+    except futures.TimeoutError:
+        return f"The function has timed out after {timeout} seconds"
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def __call_tool_guardrail_agent(tool_call, messages: list) -> tuple[str, int, str]:
+    """
+    This will ask llm if the tool call is safe to run or not and how much timeout it needs.
+    We also send previous tool calls so it can know what was written in a file before running it.
+
+    Parameters
+    ----------
+    tool_call:
+        The tool call llm wants to run.
+    messages: list
+        All messages till now in agent loop.
+
+    Returns
+    -------
+    str:
+        Verdict "safe", "unsafe" or "blocked". Anything else is taken as "unsafe".
+    int:
+        Timeout in seconds for the tool, DEFAULT_TIMEOUT if guardrail did not give one.
+    str:
+        Reason given by guardrail.
+    """
+    previous_calls = []
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            previous_calls.append(f"{call.function.name}({call.function.arguments})")
+
+    client = __get_llm()
+    try:
+        response = client.chat.completions.create(
+            model=Config.MODEL_NAME,
+            messages=[
+                {"role": "system", "content": GUARDRAIL_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Previous tool calls: {previous_calls}\n"
+                        f"Tool call to check: {tool_call.function.name}({tool_call.function.arguments})"
+                    ),
+                },
+            ],
+        )
+        answer = response.choices[0].message.content.strip()
+    except Exception as e:
+        return "unsafe", DEFAULT_TIMEOUT, f"guardrail failed due to {e}"
+
+    # Expected answer: "safe | 10 | reason"
+    parts = [part.strip() for part in answer.split("|")]
+    verdict = parts[0].lower()
+    if verdict not in ("safe", "unsafe", "blocked"):
+        verdict = "unsafe"
+
+    timeout = DEFAULT_TIMEOUT
+    if len(parts) > 1 and parts[1].isdigit():
+        # Do not let llm give a huge timeout
+        timeout = min(int(parts[1]), MAX_TIMEOUT)
+
+    reason = parts[-1] if len(parts) > 2 else answer
+    return verdict, timeout, reason
+
+
 def __invoke_tool_and_get_response(
     prev_response: ChatCompletion,
     available_tools: dict[str, Tool],
+    messages: list,
 ) -> list[dict]:
     """
     This will call all the tool necessary and return final response by llm after all tool calls.
@@ -30,6 +158,8 @@ def __invoke_tool_and_get_response(
         This the original response from the first query asked.
     available_tools: dict[str, Tool]
         This is dict containing all available tools and there callable function.
+    messages: list
+        All messages till now, used by guardrail.
 
     Returns
     -------
@@ -43,7 +173,38 @@ def __invoke_tool_and_get_response(
         if function_name in available_tools:
             tool = available_tools[function_name]
             arguments = json.loads(tool_call.function.arguments)
-            tool_result = tool["function"](**arguments)
+            log(f"  -> {function_name}({arguments})", CYAN)
+
+            # Check with guardrail and ask user if not safe
+            verdict = "safe"
+            timeout = DEFAULT_TIMEOUT
+            if function_name not in SAFE_TOOLS:
+                verdict, timeout, reason = __call_tool_guardrail_agent(
+                    tool_call, [*messages, prev_response]
+                )
+                log(
+                    f"  guardrail: {verdict}, timeout {timeout}s, {reason}",
+                    GREEN if verdict == "safe" else RED,
+                )
+
+            if verdict == "blocked":
+                # Too destructive, we never run this even if user says yes
+                log("  WARNING: this is too destructive, the agent will not run it.", RED)
+                log("  If you really need it, run it yourself:", RED)
+                log(f"  {arguments}", YELLOW)
+                tool_result = (
+                    "This tool call was BLOCKED because it is destructive and it was not executed. "
+                    "Do not retry it in any other way. Tell the user to run it themselves if they really need it."
+                )
+            elif verdict == "safe" or ask_approval(function_name):
+                tool_result = __call_function_with_timeout(
+                    function=tool["function"], arguments=arguments, timeout=timeout
+                )
+                log(f"  <- {str(tool_result)[:200]}", GREY)
+            else:
+                tool_result = "User denied this tool call. Do not retry it, tell the user why you needed it."
+                log("  denied by user", RED)
+
             tool_call_results.append(
                 {
                     "role": "tool",
@@ -103,13 +264,15 @@ def _call_reactive_agent(query: str, tools: dict[str, Tool] = {}, mode: Mode = "
                 "You are an intelligent coding agent. "
                 "Use the available tools whenever necessary to complete the task. "
                 "You may call tools multiple times. "
-                "Continue using tools until the task is completed."
+                "Continue using tools until the task is completed. "
+                "If user denies a tool call do not retry it."
             ),
         },
         {"role": "user", "content": query},
     ]
 
     while iteration < max_iteration:
+        log(f"[step {iteration + 1}/{max_iteration}] thinking...", GREY)
         follow_up = client.chat.completions.create(
             model=Config.MODEL_NAME,
             messages=messages,
@@ -126,7 +289,9 @@ def _call_reactive_agent(query: str, tools: dict[str, Tool] = {}, mode: Mode = "
             return prev_follow_up.content
 
         if prev_follow_up.tool_calls:
-            tool_call_results = __invoke_tool_and_get_response(prev_follow_up, tools)
+            tool_call_results = __invoke_tool_and_get_response(
+                prev_follow_up, tools, messages
+            )
             messages = [*messages, prev_follow_up, *tool_call_results]
         else:
             messages = [*messages, prev_follow_up]
