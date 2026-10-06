@@ -370,6 +370,10 @@ If I say no (or it is blocked), the model gets a tool result telling it so and n
 
 **The timeout comes from the same reply.** Reading a file needs a few seconds, `pip install` needs a lot more. Instead of one fixed number, the guardrail suggests one. If it doesn't give a number, it falls back to `5`, and it can never go above `120`, so the model can't ask for an hour.
 
+My first timeout was a lie, though. I wrapped tools in `with ThreadPoolExecutor()` and called `future.result(timeout=5)`. It did raise after 5 seconds... and then the `with` block quietly waited for the thread to finish anyway. A 30 second command still took 30 seconds.
+
+Python can't kill a thread, so the real fix lives in `bash_tool`: it gets the timeout, and when time is up it kills the **whole process tree** (`taskkill /T` on Windows, the process group on Linux/macOS). Just killing the shell is not enough — `python script.py` started by it keeps running happily in the background.
+
 </details>
 
 ---

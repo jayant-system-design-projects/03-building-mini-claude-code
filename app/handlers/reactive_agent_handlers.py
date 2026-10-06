@@ -1,4 +1,5 @@
 from typing import Callable, Any
+import inspect
 import json
 from concurrent import futures
 from openai import OpenAI
@@ -67,13 +68,20 @@ def __call_function_with_timeout(
     result: Any
         This the result from the function calling.
     """
+    # If tool can handle timeout itself (like bash_tool killing the process) pass it
+    if "timeout" in inspect.signature(function).parameters:
+        arguments = {**arguments, "timeout": timeout}
+
+    # Not using `with` as it waits for the thread to finish even after timeout
+    executor = futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(function, **arguments)
-            result = future.result(timeout=timeout)
-            return result
+        future = executor.submit(function, **arguments)
+        # Small buffer so tool's own timeout fires first and can clean up
+        return future.result(timeout=timeout + 2)
     except futures.TimeoutError:
-        return "The function has timed out reason"
+        return f"The function has timed out after {timeout} seconds"
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def __call_tool_guardrail_agent(tool_call, messages: list) -> tuple[str, int, str]:

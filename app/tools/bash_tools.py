@@ -1,4 +1,6 @@
+import os
 import re
+import signal
 import subprocess
 import platform
 from app.schemas.base_tool_schema import ToolBase, Function, Parameters, Properties
@@ -98,9 +100,36 @@ def __check_platform_system() -> str:
     return platform.system()
 
 
-def __bash_command_executor(command: str, system: str) -> dict | str:
+def __kill_process_tree(process: subprocess.Popen, system: str):
     """
-    This will write content in file if exist else create one and write.
+    This will kill the shell and every process started by it.
+    Only killing the shell is not enough, as `python script.py` started by it keeps running.
+
+    Parameters
+    ----------
+    process: subprocess.Popen
+        The shell process started for the command.
+    system: str
+        The system/OS name, e.g. 'Linux', 'Windows' or 'Java'.
+
+    Returns
+    -------
+    None
+    """
+    if system == "Windows":
+        # /T kills child processes too, /F forces it
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True
+        )
+    else:
+        # Process was started in its own group so we can kill whole group
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+
+
+def __bash_command_executor(command: str, system: str, timeout: int = 5) -> dict | str:
+    """
+    This will run the command in shell and stop it if it takes more than timeout.
 
     Parameters
     ----------
@@ -108,6 +137,8 @@ def __bash_command_executor(command: str, system: str) -> dict | str:
         This is command which need execution.
     system: str
         The system/OS name, e.g. 'Linux', 'Windows' or 'Java'.
+    timeout: int
+        Seconds after which command is killed. This is passed by agent, not by llm.
 
     Returns
     -------
@@ -131,18 +162,26 @@ def __bash_command_executor(command: str, system: str) -> dict | str:
     if not is_safe:
         return message
 
-    result = subprocess.run(
+    process = subprocess.Popen(
         command,
         shell=True,
         executable=shell if system != "Windows" else None,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        start_new_session=system != "Windows",
     )
 
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        __kill_process_tree(process, system)
+        return f"Command timed out after {timeout} seconds and was stopped."
+
     return {
-        "result": result.stdout,
-        "error": result.stderr,
-        "return_code": result.returncode,
+        "result": stdout,
+        "error": stderr,
+        "return_code": process.returncode,
     }
 
 
